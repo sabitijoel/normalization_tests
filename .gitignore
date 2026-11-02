@@ -1,0 +1,59 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Experiment outputs
+graphs/
+test/
+train_norm_tests/
+validation_norm_test/
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# Environments and secrets
+.env
+.venv/
+venv/
+
+# Generated experiment list
+norm_study_folders.txt
+
+# SLURM output files
+*.out
+*.err
+
+# CSV experiment results
+*.csv
+
+# SLURM output files
+*.out
+*.err
+
+# CSV experiment results
+*.csv
+
+# SLURM and job output files
+*.out
+*.err
+
+# Text files
+*.txt
+
+# CSV results
+*.csv

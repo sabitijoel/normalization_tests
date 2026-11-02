@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Evaluate one selected norm-study generator checkpoint on a test or OOD dataset.
+
+Same metric contract as validation.py (and the corrected grayscale baseline):
+metric definitions, Inception model, preprocessing, image pairing, resizing and
+aggregation all come from checkpoint_evaluation_core / comparable_metrics.
+
+Differences from the single-model evaluator:
+  --gen-norm / --generator-module  build Generator(norm_kind) with the norm the
+                                   checkpoint was trained with
+  --model-name                     written to the 'model' column (e.g. the cell)
+  epoch parsed from '..._epoch_<N>' so the seed in the name is not mistaken for it
+"""
+
+from __future__ import annotations
+import os
+import sys
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+)
+import argparse
+import csv
+import importlib
+import re
+from pathlib import Path
+from typing import Dict, Sequence
+
+from checkpoint_evaluation_core import (
+    configure_reproducibility,
+    evaluate_checkpoint,
+    extract_epoch_from_checkpoint,
+    resolve_device,
+)
+from comparable_metrics import DeepMetricModels, MetricResult, pair_images
+
+
+DEFAULT_GRAY_DIR = Path(
+    "/cbio/projects/037/jsabiti/datasets/ISIC/ISIC2018_Task3_Test_Input/gray"
+)
+DEFAULT_RGB_DIR = Path(
+    "/cbio/projects/037/jsabiti/datasets/ISIC/ISIC2018_Task3_Test_Input/rgb"
+)
+DEFAULT_OUTPUT_DIR = Path("/users/sabitijoel/workspace/translation/bce/normalization_tests/test/testing")
+DEFAULT_IMAGE_SIZE = 256
+DEFAULT_BATCH_SIZE = 16
+NORM_CHOICES = ("bn", "in", "ln", "gn", "none")
+
+CSV_COLUMNS = (
+    "model",
+    "dataset",
+    "checkpoint",
+    "epoch",
+    "n_images",
+    "psnr",
+    "ssim",
+    "uv_psnr",
+    "uv_ssim",
+    "u_ssim",
+    "v_ssim",
+    "rmse",
+    "mae",
+    "delta_e",
+    "lpips",
+    "kid",
+    "fid",
+)
+
+
+def make_generator_factory(module_name: str, gen_norm: str):
+    generator_cls = importlib.import_module(module_name).Generator
+
+    def factory():
+        return generator_cls(gen_norm)
+
+    return factory
+
+
+def epoch_of(checkpoint: Path) -> int:
+    match = re.search(r"epoch[_-]?(\d+)", checkpoint.stem)
+    if match:
+        return int(match.group(1))
+    return extract_epoch_from_checkpoint(checkpoint.stem)
+
+
+def result_row(
+    checkpoint: Path,
+    model_name: str,
+    dataset_name: str,
+    result: MetricResult,
+) -> Dict[str, object]:
+    values = result.as_dict()
+    row: Dict[str, object] = {
+        "model": model_name,
+        "dataset": dataset_name,
+        "checkpoint": checkpoint.stem,
+        "epoch": epoch_of(checkpoint),
+        "n_images": result.n_images,
+    }
+    for name in CSV_COLUMNS[5:]:
+        row[name] = f"{float(values[name]):.10g}"
+    return row
+
+
+def append_csv(row: Dict[str, object], output_path: Path) -> None:
+    """Append or replace the same checkpoint/dataset row atomically."""
+    existing: list[Dict[str, str]] = []
+    if output_path.is_file():
+        with output_path.open("r", newline="", encoding="utf-8") as handle:
+            existing = list(csv.DictReader(handle))
+
+    key = (str(row["dataset"]), str(row["checkpoint"]))
+    retained = [
+        item for item in existing
+        if (item.get("dataset", ""), item.get("checkpoint", "")) != key
+    ]
+    retained.append({column: str(row[column]) for column in CSV_COLUMNS})
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(retained)
+    temporary.replace(output_path)
+
+
+def print_result(checkpoint: Path, dataset_name: str, result: MetricResult) -> None:
+    print("\n" + "=" * 74)
+    print(f"Dataset    : {dataset_name}")
+    print(f"Checkpoint : {checkpoint.name}")
+    print(f"Epoch      : {epoch_of(checkpoint)}")
+    print(f"Images     : {result.n_images}")
+    print("=" * 74)
+    print(f"Y-PSNR     : {result.psnr:.6f}")
+    print(f"Y-SSIM     : {result.ssim:.6f}")
+    print(f"UV-PSNR    : {result.uv_psnr:.6f}")
+    print(f"UV-SSIM    : {result.uv_ssim:.6f}")
+    print(f"  U-SSIM   : {result.u_ssim:.6f}")
+    print(f"  V-SSIM   : {result.v_ssim:.6f}")
+    print(f"RGB-RMSE   : {result.rmse:.6f}")
+    print(f"RGB-MAE    : {result.mae:.6f}")
+    print(f"CIEDE2000  : {result.delta_e:.6f}")
+    print(f"LPIPS-VGG  : {result.lpips:.6f}")
+    print(f"KID        : {result.kid:.6f}")
+    print(f"FID        : {result.fid:.6f}")
+
+
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate one norm-study checkpoint with the comparable metric contract."
+    )
+    parser.add_argument("checkpoint", type=Path, help="Path to the generator checkpoint.")
+    parser.add_argument("--gen-norm", choices=NORM_CHOICES, required=True,
+                        help="normalisation the generator was trained with")
+    parser.add_argument("--generator-module", default="p2p",
+                        help="module defining Generator(norm_kind)")
+    parser.add_argument("--model-name", default="GENERATOR",
+                        help="value for the 'model' column, e.g. the cell name")
+    parser.add_argument("--dataset-name", default="ISIC_TEST")
+    parser.add_argument("--gray-dir", type=Path, default=DEFAULT_GRAY_DIR)
+    parser.add_argument("--rgb-dir", type=Path, default=DEFAULT_RGB_DIR)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--non-strict-checkpoint",
+        action="store_true",
+        help="Permit missing/unexpected checkpoint keys, but print them.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.image_size < 11:
+        parser.error("--image-size must be at least 11.")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1.")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_arguments(argv)
+    configure_reproducibility(args.seed)
+    device = resolve_device(args.device)
+
+    if not args.checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+
+    manifest = pair_images(args.gray_dir, args.rgb_dir)
+    if not manifest:
+        raise RuntimeError("No matched grayscale/RGB image pairs were found.")
+
+    print("=" * 78)
+    print("COMPARABLE SINGLE-CHECKPOINT EVALUATION")
+    print(f"Model             : {args.model_name}")
+    print(f"Dataset           : {args.dataset_name}")
+    print(f"Checkpoint        : {args.checkpoint}")
+    print(f"Generator norm    : {args.gen_norm}  (from {args.generator_module}.Generator)")
+    print(f"Image manifest    : {len(manifest)} matched pairs")
+    print(f"Image size        : {args.image_size}")
+    print(f"Batch size        : {args.batch_size}")
+    print(f"Device            : {device}")
+    print("Metric contract   : Y-PSNR/Y-SSIM, zero-centred UV, shared LPIPS/Inception")
+    print("=" * 78)
+
+    print("\nLoading LPIPS-VGG and torchvision Inception-v3...")
+    deep_models = DeepMetricModels(device)
+
+    result = evaluate_checkpoint(
+        args.checkpoint,
+        generator_factory=make_generator_factory(args.generator_module, args.gen_norm),
+        gray_dir=args.gray_dir,
+        rgb_dir=args.rgb_dir,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        device=device,
+        deep_models=deep_models,
+        strict_checkpoint=not args.non_strict_checkpoint,
+        pairs=manifest,
+    )
+
+    print_result(args.checkpoint, args.dataset_name, result)
+    row = result_row(args.checkpoint, args.model_name, args.dataset_name, result)
+    csv_path = args.output_dir / "checkpoint_evaluation_metrics.csv"
+    append_csv(row, csv_path)
+    print(f"\nCSV saved to: {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
