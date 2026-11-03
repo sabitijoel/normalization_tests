@@ -1,15 +1,19 @@
 #!/bin/bash
 # Build the test list, submit one evaluation per cell/seed,
 # and queue the summary job after the evaluation array.
+# Each evaluation task tests its checkpoint on every test dataset
+# registered in test_checkpoint.py (ISIC_TEST, PH2, SD-198).
 
 set -euo pipefail
 
 BASE="/users/sabitijoel/workspace/translation/bce/normalization_tests"
 CODE_DIR="$BASE/test/testing"
 CKPT_ROOT="/cbio/projects/037/jsabiti/datasets/ISIC/checkpoints/norm_study"
-SELECTION="$BASE/test/selecting_best_epoch/best_epoch_per_run.csv"
+SELECTION="$BASE/test/selecting_best_epoch/BALANCED_LR/best_epoch_per_run.csv"
 TEST_SCRIPT="$CODE_DIR/test_norm_study.sh"
+TEST_PY="$CODE_DIR/test_checkpoint.py"
 SUMMARY_SCRIPT="$CODE_DIR/summarise_test.sh"
+SUMMARY_PY="$CODE_DIR/summarise_test.py"
 TEST_LIST="$CODE_DIR/test_list.txt"
 MAX_PARALLEL=4
 
@@ -20,7 +24,7 @@ module load python/3.11
 source /users/sabitijoel/workspace/myenv/bin/activate
 
 # Check required files and directories.
-for file in "$SELECTION" "$TEST_SCRIPT" "$SUMMARY_SCRIPT"; do
+for file in "$SELECTION" "$TEST_SCRIPT" "$TEST_PY" "$SUMMARY_SCRIPT" "$SUMMARY_PY"; do
     if [[ ! -f "$file" ]]; then
         echo "ERROR: Required file not found: $file" >&2
         exit 1
@@ -31,6 +35,21 @@ if [[ ! -d "$CKPT_ROOT" ]]; then
     echo "ERROR: Checkpoint directory not found: $CKPT_ROOT" >&2
     exit 1
 fi
+
+# Pair every test dataset with the same code the array tasks use, so a missing
+# folder or .bmp files that pair_images skips stop the submission here instead
+# of failing in every task.
+echo "Checking test datasets:"
+python - <<'PY'
+import test_checkpoint as tc
+
+total = 0
+for name, (gray_dir, rgb_dir) in tc.DATASETS.items():
+    pairs = tc.build_manifest(name, gray_dir, rgb_dir)
+    total += len(pairs)
+    print(f"  {name:<10} {len(pairs):>6} image pairs")
+print(f"  {'total':<10} {total:>6} image pairs per task")
+PY
 
 # Generate test_list.txt.
 # Format: cell seed epoch gen_norm checkpoint_path

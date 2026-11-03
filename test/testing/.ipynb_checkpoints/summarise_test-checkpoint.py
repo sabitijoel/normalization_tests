@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Collect the test-set results of every norm-study run and summarise them.
+Collect the test and OOD results of every norm-study run and summarise them.
 
-Reads  <test_root>/<cell>/seed_<N>/checkpoint_evaluation_metrics.csv
-(one row each: the validation-selected checkpoint evaluated on the test set)
-and writes to <test_root>:
+Reads  <test_root>/results/<cell>/seed_<N>/checkpoint_evaluation_metrics.csv
+(one row per dataset: the validation-selected checkpoint evaluated on
+ISIC_TEST, PH2 and SD-198) and writes to <test_root>, for each dataset <D>:
 
-  test_per_run.csv     one row per cell x seed (epoch + all test metrics)
-  test_per_cell.csv    mean and std over seeds per cell, sorted by Delta E
-  test_pivot_<m>.csv   generator-norm x discriminator-norm grids of the seed mean
+  test_per_run_<D>.csv     one row per cell x seed (epoch + all metrics)
+  test_per_cell_<D>.csv    mean and std over seeds per cell, sorted by Delta E
+  test_pivot_<m>_<D>.csv   generator-norm x discriminator-norm grids of the seed mean
 
-Usage:  python summarise_test.py [--test-root ...] [--dataset ISIC_TEST]
+and, when more than one dataset is summarised:
+
+  test_cross_dataset_<m>.csv   cell x dataset table of the seed mean,
+                               sorted by the first dataset (ISIC_TEST)
+
+Usage:  python summarise_test.py [--test-root ...] [--datasets ISIC_TEST PH2 SD-198]
+        (default: every dataset found in the CSVs)
 """
 import argparse
 import re
@@ -30,38 +36,49 @@ METRICS = {  # name: higher is better
 }
 GRID_METRICS = ["delta_e", "uv_ssim", "uv_psnr"]
 NORM_ORDER = ["bn", "in", "ln", "gn", "none"]
+DATASET_ORDER = ["ISIC_TEST", "PH2", "SD-198"]  # any other dataset follows, alphabetically
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--test-root", type=Path, default=DEFAULT_ROOT)
-    p.add_argument("--dataset", default="ISIC_TEST")
-    args = p.parse_known_args()[0]
-
-    files = sorted(
-        args.test_root.glob("results/*/seed_*/checkpoint_evaluation_metrics.csv")
-    )
+def load_runs(test_root: Path) -> pd.DataFrame:
+    """One row per cell x seed x dataset."""
+    files = sorted(test_root.glob("results/*/seed_*/checkpoint_evaluation_metrics.csv"))
     if not files:
-        raise SystemExit(f"No test CSVs under {args.test_root}/<cell>/seed_*/")
+        raise SystemExit(f"No test CSVs under {test_root}/results/<cell>/seed_*/")
 
-    rows = []
+    rows, stale = [], []
     for f in files:
         cell, seed = f.parent.parent.name, int(f.parent.name.split("_", 1)[1])
         df = pd.read_csv(f)
-        df = df[df["dataset"] == args.dataset]
         if df.empty:
             continue
-        r = df.iloc[-1]
-        m = CELL_RE.match(cell)
-        row = {"cell": cell, "gen_norm": m.group(1) if m else None,
-               "disc_norm": m.group(2) if m else None,
-               "batch_size": int(m.group(3)) if m and m.group(3) else 8,
-               "seed": seed, "epoch": int(r["epoch"]), "n_images": int(r["n_images"])}
-        row.update({k: float(r[k]) for k in METRICS if k in r})
-        rows.append(row)
+        # The last row written belongs to the run's current checkpoint. Rows left
+        # from an earlier best-epoch selection are ignored, so every dataset of a
+        # run comes from the same checkpoint and a failed dataset shows up as
+        # missing instead of silently reusing an old result.
+        current = df["checkpoint"].iloc[-1]
+        if (df["checkpoint"] != current).any():
+            stale.append(f"{cell}/seed_{seed}")
+        df = df[df["checkpoint"] == current]
 
-    per_run = pd.DataFrame(rows).sort_values(["cell", "seed"]).reset_index(drop=True)
-    per_run.to_csv(args.test_root / "test_per_run.csv", index=False)
+        m = CELL_RE.match(cell)
+        for dataset, group in df.groupby("dataset", sort=False):
+            r = group.iloc[-1]
+            row = {"dataset": dataset, "cell": cell,
+                   "gen_norm": m.group(1) if m else None,
+                   "disc_norm": m.group(2) if m else None,
+                   "batch_size": int(m.group(3)) if m and m.group(3) else 8,
+                   "seed": seed, "epoch": int(r["epoch"]), "n_images": int(r["n_images"])}
+            row.update({k: float(r[k]) for k in METRICS if k in r})
+            rows.append(row)
+
+    if stale:
+        print("Ignored rows from older checkpoints in: " + ", ".join(stale) + "\n")
+    return pd.DataFrame(rows)
+
+
+def summarise_dataset(per_run: pd.DataFrame, dataset: str, test_root: Path) -> pd.DataFrame:
+    per_run = per_run.sort_values(["cell", "seed"]).reset_index(drop=True)
+    per_run.to_csv(test_root / f"test_per_run_{dataset}.csv", index=False)
 
     metric_cols = [k for k in METRICS if k in per_run.columns]
     per_cell = (per_run.groupby(["cell", "gen_norm", "disc_norm", "batch_size"])
@@ -69,10 +86,15 @@ def main():
                      **{f"{k}_mean": (k, "mean") for k in metric_cols},
                      **{f"{k}_std": (k, "std") for k in metric_cols})
                 .reset_index().sort_values("delta_e_mean"))
-    per_cell.to_csv(args.test_root / "test_per_cell.csv", index=False)
+    per_cell.insert(0, "dataset", dataset)
+    per_cell.to_csv(test_root / f"test_per_cell_{dataset}.csv", index=False)
 
-    print(f"{len(per_run)} runs, {per_cell.shape[0]} cells, dataset {args.dataset} "
-          f"({per_run['n_images'].iloc[0]} images)\n")
+    sizes = sorted(per_run["n_images"].unique())
+    size_note = (f"{sizes[0]} images" if len(sizes) == 1
+                 else f"WARNING: image counts differ between runs {sizes}")
+    print("=" * 78)
+    print(f"{dataset}: {len(per_run)} runs, {per_cell.shape[0]} cells, {size_note}")
+    print("=" * 78)
     print("Per cell, mean ± std over seeds (sorted by Delta E, lower is better):")
     for _, r in per_cell.iterrows():
         parts = [f"{k}={r[f'{k}_mean']:.4f}±{(r[f'{k}_std'] if pd.notna(r[f'{k}_std']) else 0):.4f}"
@@ -85,14 +107,65 @@ def main():
         pivot = pivot.reindex(index=[n for n in NORM_ORDER if n in pivot.index],
                               columns=[n for n in NORM_ORDER if n in pivot.columns])
         pivot.index.name, pivot.columns.name = "generator \\ discriminator", None
-        pivot.to_csv(args.test_root / f"test_pivot_{k}.csv")
-        print(f"\n{k} on test (seed mean, {'higher' if METRICS[k] else 'lower'} is better):")
+        pivot.to_csv(test_root / f"test_pivot_{k}_{dataset}.csv")
+        print(f"\n{k} on {dataset} (seed mean, {'higher' if METRICS[k] else 'lower'} is better):")
         print(pivot.to_string(float_format=lambda x: f"{x:.4f}"))
 
     incomplete = per_cell[per_cell["n_seeds"] < per_cell["n_seeds"].max()]
     if not incomplete.empty:
-        print("\nCells missing seeds: " + ", ".join(incomplete["cell"]))
-    print(f"\nSaved to {args.test_root}: test_per_run.csv, test_per_cell.csv, test_pivot_<metric>.csv")
+        print(f"\nCells missing seeds on {dataset}: " + ", ".join(incomplete["cell"]))
+    print()
+    return per_cell
+
+
+def cross_dataset_tables(per_cell_all: pd.DataFrame, datasets: list, test_root: Path) -> None:
+    """cell x dataset tables of the seed mean, sorted by the first dataset."""
+    reference = datasets[0]
+    print("=" * 78)
+    print(f"ACROSS DATASETS (seed mean per cell, sorted by {reference})")
+    print("=" * 78)
+    for k in GRID_METRICS:
+        table = per_cell_all.pivot_table(index="cell", columns="dataset",
+                                         values=f"{k}_mean", aggfunc="first")
+        table = table.reindex(columns=[d for d in datasets if d in table.columns])
+        if reference in table.columns:
+            table = table.sort_values(reference, ascending=not METRICS[k])
+        table.columns.name = None
+        table.to_csv(test_root / f"test_cross_dataset_{k}.csv")
+        print(f"\n{k} ({'higher' if METRICS[k] else 'lower'} is better):")
+        print(table.to_string(float_format=lambda x: f"{x:.4f}"))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--test-root", type=Path, default=DEFAULT_ROOT)
+    p.add_argument("--datasets", "--dataset", nargs="+", default=None,
+                   help="datasets to summarise (default: every dataset found)")
+    args = p.parse_known_args()[0]
+
+    runs = load_runs(args.test_root)
+    if runs.empty:
+        raise SystemExit(f"Every test CSV under {args.test_root}/results/ is empty.")
+
+    found = list(runs["dataset"].unique())
+    if args.datasets:
+        missing = [d for d in args.datasets if d not in found]
+        if missing:
+            print(f"No rows for: {', '.join(missing)} (found: {', '.join(found)})\n")
+        datasets = [d for d in dict.fromkeys(args.datasets) if d in found]
+    else:
+        rank = {d: i for i, d in enumerate(DATASET_ORDER)}
+        datasets = sorted(found, key=lambda d: (rank.get(d, len(rank)), d))
+    if not datasets:
+        raise SystemExit("No rows for the requested datasets.")
+
+    per_cells = [summarise_dataset(runs[runs["dataset"] == d], d, args.test_root)
+                 for d in datasets]
+    written = "test_per_run_<D>.csv, test_per_cell_<D>.csv, test_pivot_<metric>_<D>.csv"
+    if len(datasets) > 1:
+        cross_dataset_tables(pd.concat(per_cells, ignore_index=True), datasets, args.test_root)
+        written += ", test_cross_dataset_<metric>.csv"
+    print(f"\nSaved to {args.test_root} for {', '.join(datasets)}: {written}")
 
 
 if __name__ == "__main__":
